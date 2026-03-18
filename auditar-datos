@@ -1,0 +1,75 @@
+AGENTES GOOGLE CLOUD RUN
+
+(auditar-datos)
+
+requirements.txt:
+
+functions-framework==3.*
+google-cloud-bigquery==3.*
+
+
+
+MAIN.PY:
+
+import base64
+import functions_framework
+from google.cloud import bigquery
+
+BQ_LOCATION = "US"
+
+@functions_framework.cloud_event
+def auditar_datos(cloud_event):
+    brand_id = base64.b64decode(cloud_event.data["message"]["data"]).decode("utf-8")
+    bq = bigquery.Client()
+
+    sql = f"""
+    CREATE OR REPLACE TABLE `{bq.project}.{brand_id}_ai.auditoria_datos` AS
+    WITH pedidos_limpios AS (
+      SELECT
+        COUNT(*) AS filas_fact_pedidos_limpios,
+        COUNT(DISTINCT order_id) AS pedidos_unicos,
+        COUNTIF(email_valido_flag) AS filas_con_email_valido,
+        COUNTIF(telefono_valido_flag) AS filas_con_telefono_valido,
+        COUNTIF(fecha_valida_flag) AS filas_con_fecha_valida,
+        COUNTIF(monto_valido_flag) AS filas_con_monto_valido,
+        COUNTIF(producto_valido_flag) AS filas_con_producto_valido
+      FROM `{bq.project}.{brand_id}_core.fact_pedidos_limpios`
+    ),
+    clientes AS (
+      SELECT
+        COUNT(*) AS clientes_unicos,
+        COUNTIF(requiere_revision) AS clientes_requieren_revision,
+        COUNTIF(email_principal IS NOT NULL AND email_principal != '') AS clientes_con_email,
+        COUNTIF(telefono_principal IS NOT NULL AND telefono_principal != '') AS clientes_con_telefono
+      FROM `{bq.project}.{brand_id}_core.dim_clientes`
+    ),
+    pedidos AS (
+      SELECT
+        COUNT(*) AS filas_fact_pedidos,
+        COUNTIF(cliente_id IS NOT NULL) AS pedidos_asignados_a_cliente
+      FROM `{bq.project}.{brand_id}_core.fact_pedidos`
+    ),
+    productos AS (
+      SELECT
+        COUNT(*) AS filas_fact_pedido_productos,
+        COUNTIF(precio_linea_clp IS NOT NULL) AS filas_con_precio_linea,
+        COUNTIF(precio_linea_inferida_flag) AS filas_precio_inferido
+      FROM `{bq.project}.{brand_id}_core.fact_pedido_productos`
+    )
+    SELECT
+      CURRENT_TIMESTAMP() AS auditado_el,
+      p.*,
+      c.*,
+      pe.*,
+      pr.*,
+      SAFE_DIVIDE(p.filas_con_email_valido, NULLIF(p.filas_fact_pedidos_limpios, 0)) AS pct_email_valido,
+      SAFE_DIVIDE(p.filas_con_telefono_valido, NULLIF(p.filas_fact_pedidos_limpios, 0)) AS pct_telefono_valido,
+      SAFE_DIVIDE(pe.pedidos_asignados_a_cliente, NULLIF(pe.filas_fact_pedidos, 0)) AS pct_pedidos_asignados_cliente,
+      SAFE_DIVIDE(c.clientes_requieren_revision, NULLIF(c.clientes_unicos, 0)) AS pct_clientes_revision
+    FROM pedidos_limpios p
+    CROSS JOIN clientes c
+    CROSS JOIN pedidos pe
+    CROSS JOIN productos pr
+    """
+    bq.query(sql, location=BQ_LOCATION).result()
+    print(f"✅ auditoría de datos actualizada para {brand_id}")
