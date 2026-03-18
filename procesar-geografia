@@ -1,6 +1,6 @@
 AGENTES GOOGLE CLOUD RUN
 
-(procesar-geografia)
+(procesar-clientes)
 
 requirements.txt:
 
@@ -12,288 +12,40 @@ google-cloud-bigquery==3.*
 MAIN.PY:
 
 import base64
-import json
-import traceback
-
 import functions_framework
 from google.cloud import bigquery
 
 BQ_LOCATION = "US"
 
-
-def _decode_pubsub_message(cloud_event) -> dict:
-    message = cloud_event.data.get("message", {})
-    raw_b64 = message.get("data", "")
-
-    if not raw_b64:
-        raise ValueError("El evento no trae message.data")
-
-    decoded = base64.b64decode(raw_b64).decode("utf-8").strip()
-
-    if not decoded.startswith("{"):
-        return {"brand_id": decoded}
-
-    payload = json.loads(decoded)
-
-    brand_id = (
-        payload.get("brand_id")
-        or payload.get("marca")
-        or payload.get("dataset")
-        or payload.get("brand")
-    )
-
-    if not brand_id:
-        raise ValueError(f"No encontré brand_id en el payload JSON: {payload}")
-
-    return {"brand_id": brand_id, "payload": payload}
-
-
-def _run_query(bq: bigquery.Client, sql: str, label: str) -> None:
-    print(f"▶ Ejecutando paso: {label}")
-    job = bq.query(sql, location=BQ_LOCATION)
-    job.result()
-    print(f"✅ Paso completado: {label}")
-
-
-def _get_table_columns(bq: bigquery.Client, table_id: str) -> list[str]:
-    table = bq.get_table(table_id)
-    return [field.name for field in table.schema]
-
-
-def _pick_first_existing(columns: list[str], candidates: list[str], table_name: str) -> str:
-    for candidate in candidates:
-        if candidate in columns:
-            return candidate
-    raise ValueError(
-        f"No encontré ninguna de estas columnas en {table_name}: {candidates}. "
-        f"Columnas disponibles: {columns}"
-    )
-
-
 @functions_framework.cloud_event
-def procesar_geografia(cloud_event):
-    try:
-        parsed = _decode_pubsub_message(cloud_event)
-        brand_id = parsed["brand_id"]
+def procesar_clientes(cloud_event):
+    brand_id = base64.b64decode(cloud_event.data["message"]["data"]).decode("utf-8")
+    bq = bigquery.Client()
 
-        print(f"📩 Evento recibido para brand_id={brand_id}")
+    sql = f"""
+    CREATE OR REPLACE TABLE `{bq.project}.{brand_id}_ai.perfil_clientes_360` AS
+    WITH contexto AS (
+      SELECT MAX(fecha) AS fecha_max_global
+      FROM `{bq.project}.{brand_id}_core.fact_pedidos_limpios`
+    )
+    SELECT
+      c.cliente_id,
+      c.nombre,
+      c.email,
+      c.telefono,
+      c.total_compras,
+      c.ltv_historico,
+      DATE_DIFF(CURRENT_DATE(), DATE(c.fecha_ultima_compra), DAY) AS dias_inactividad,
+      CASE
+        WHEN DATE(c.fecha_primera_compra) >= DATE_SUB(DATE(cx.fecha_max_global), INTERVAL 3 MONTH) THEN 'CLIENTE NUEVO'
+        WHEN c.total_compras >= 3 THEN 'CLIENTE CAMPEON'
+        WHEN DATE_DIFF(CURRENT_DATE(), DATE(c.fecha_ultima_compra), DAY) > 90 THEN 'CLIENTE EN RIESGO'
+        ELSE 'CLIENTE ACTIVO'
+      END AS segmento_valor
+    FROM `{bq.project}.{brand_id}_core.dim_clientes` c
+    CROSS JOIN contexto cx
+    """
+    bq.query(sql, location=BQ_LOCATION).result()
+    print(f"✅ perfil_clientes_360 actualizado para {brand_id}")
 
-        bq = bigquery.Client()
-        project_id = bq.project
-
-        core_dataset = f"{brand_id}_core"
-        ai_dataset = f"{brand_id}_ai"
-
-        fact_pedidos_id = f"{project_id}.{core_dataset}.fact_pedidos"
-        geo_maestro_id = f"{project_id}.{ai_dataset}.geo_maestro_comunas"
-
-        tablas_requeridas = [
-            fact_pedidos_id,
-            geo_maestro_id,
-        ]
-
-        for table_id in tablas_requeridas:
-            try:
-                bq.get_table(table_id)
-                print(f"✅ Tabla encontrada: {table_id}")
-            except Exception as e:
-                raise ValueError(
-                    f"No existe o no tengo acceso a la tabla requerida: {table_id}. Error: {e}"
-                )
-
-        fp_cols = _get_table_columns(bq, fact_pedidos_id)
-        print(f"🧩 Columnas fact_pedidos: {fp_cols}")
-
-        fp_order_id_col = _pick_first_existing(
-            fp_cols, ["order_id", "pedido_id", "id_pedido"], "fact_pedidos"
-        )
-        fp_cliente_id_col = _pick_first_existing(
-            fp_cols, ["client_id", "cliente_id", "id_cliente"], "fact_pedidos"
-        )
-        fp_ciudad_col = _pick_first_existing(
-            fp_cols, ["ciudad_usada", "comuna", "city", "ciudad"], "fact_pedidos"
-        )
-        fp_fecha_col = _pick_first_existing(
-            fp_cols, ["fecha_pedido", "fecha", "created_at", "order_date"], "fact_pedidos"
-        )
-        fp_total_col = _pick_first_existing(
-            fp_cols, ["total_pedido_clp", "total_pedido", "total", "monto_total", "total_precio"], "fact_pedidos"
-        )
-
-        print(
-            f"✅ Columnas detectadas: order_id={fp_order_id_col}, "
-            f"client_id={fp_cliente_id_col}, ciudad={fp_ciudad_col}, "
-            f"fecha={fp_fecha_col}, total={fp_total_col}"
-        )
-
-        # ============================================================
-        # 1) BASE GEOGRAFICA POR PEDIDO
-        # ============================================================
-        sql_geo_pedidos_base = f"""
-        CREATE OR REPLACE TABLE `{project_id}.{ai_dataset}.geo_pedidos_base`
-        PARTITION BY DATE(fecha_pedido)
-        CLUSTER BY region_canonica, provincia_canonica, comuna_canonica, client_id AS
-
-        WITH pedidos_base AS (
-          SELECT
-            CAST({fp_order_id_col} AS STRING) AS order_id,
-            CAST({fp_cliente_id_col} AS STRING) AS client_id,
-            SAFE_CAST({fp_fecha_col} AS TIMESTAMP) AS fecha_pedido,
-            SAFE_CAST({fp_total_col} AS NUMERIC) AS total_pedido_clp,
-            CAST({fp_ciudad_col} AS STRING) AS ciudad_usada_original,
-
-            TRIM(
-              REGEXP_REPLACE(
-                UPPER(
-                  REGEXP_REPLACE(
-                    REGEXP_REPLACE(
-                      REGEXP_REPLACE(
-                        REGEXP_REPLACE(
-                          REGEXP_REPLACE(
-                            REGEXP_REPLACE(CAST({fp_ciudad_col} AS STRING), r'[ÁÀÄÂ]', 'A'),
-                            r'[ÉÈËÊ]', 'E'
-                          ),
-                          r'[ÍÌÏÎ]', 'I'
-                        ),
-                        r'[ÓÒÖÔ]', 'O'
-                      ),
-                      r'[ÚÙÜÛ]', 'U'
-                    ),
-                    r'Ñ', 'N'
-                  )
-                ),
-                r'[^A-Z0-9 ]', ' '
-              )
-            ) AS comuna_join_key
-          FROM `{fact_pedidos_id}`
-          WHERE {fp_order_id_col} IS NOT NULL
-            AND {fp_cliente_id_col} IS NOT NULL
-            AND {fp_fecha_col} IS NOT NULL
-        ),
-
-        pedidos_limpios AS (
-          SELECT
-            order_id,
-            client_id,
-            fecha_pedido,
-            total_pedido_clp,
-            ciudad_usada_original,
-            TRIM(REGEXP_REPLACE(comuna_join_key, r'\\s+', ' ')) AS comuna_join_key
-          FROM pedidos_base
-        ),
-
-        maestro_limpio AS (
-          SELECT
-            comuna_canonica,
-            provincia_canonica,
-            region_canonica,
-            TRIM(
-              REGEXP_REPLACE(
-                UPPER(
-                  REGEXP_REPLACE(
-                    REGEXP_REPLACE(
-                      REGEXP_REPLACE(
-                        REGEXP_REPLACE(
-                          REGEXP_REPLACE(
-                            REGEXP_REPLACE(CAST(comuna_canonica AS STRING), r'[ÁÀÄÂ]', 'A'),
-                            r'[ÉÈËÊ]', 'E'
-                          ),
-                          r'[ÍÌÏÎ]', 'I'
-                        ),
-                        r'[ÓÒÖÔ]', 'O'
-                      ),
-                      r'[ÚÙÜÛ]', 'U'
-                    ),
-                    r'Ñ', 'N'
-                  )
-                ),
-                r'[^A-Z0-9 ]', ' '
-              )
-            ) AS comuna_join_key
-          FROM `{geo_maestro_id}`
-        ),
-
-        pedidos_deduplicados AS (
-          SELECT *
-          FROM (
-            SELECT
-              order_id,
-              client_id,
-              fecha_pedido,
-              total_pedido_clp,
-              ciudad_usada_original,
-              comuna_join_key,
-              ROW_NUMBER() OVER (
-                PARTITION BY order_id
-                ORDER BY fecha_pedido DESC
-              ) AS rn
-            FROM pedidos_limpios
-          )
-          WHERE rn = 1
-        )
-
-        SELECT
-          p.order_id,
-          p.client_id,
-          p.fecha_pedido,
-          p.total_pedido_clp,
-          p.ciudad_usada_original,
-          p.comuna_join_key,
-          m.comuna_canonica,
-          m.provincia_canonica,
-          m.region_canonica
-        FROM pedidos_deduplicados p
-        LEFT JOIN maestro_limpio m
-          ON p.comuna_join_key = m.comuna_join_key;
-        """
-        _run_query(bq, sql_geo_pedidos_base, "geo_pedidos_base")
-
-        # ============================================================
-        # 2) NO MATCH GEO
-        # ============================================================
-        sql_geo_no_match = f"""
-        CREATE OR REPLACE TABLE `{project_id}.{ai_dataset}.geo_no_match` AS
-        SELECT
-          order_id,
-          client_id,
-          fecha_pedido,
-          ciudad_usada_original,
-          comuna_join_key,
-          total_pedido_clp
-        FROM `{project_id}.{ai_dataset}.geo_pedidos_base`
-        WHERE comuna_canonica IS NULL;
-        """
-        _run_query(bq, sql_geo_no_match, "geo_no_match")
-
-        # ============================================================
-        # 3) RESUMEN GEOGRAFIA
-        # ============================================================
-        sql_resumen_geografia = f"""
-        CREATE OR REPLACE TABLE `{project_id}.{ai_dataset}.resumen_geografia` AS
-        SELECT
-          comuna_canonica,
-          provincia_canonica,
-          region_canonica,
-          COUNT(DISTINCT order_id) AS pedidos_totales,
-          COUNT(DISTINCT client_id) AS clientes_unicos,
-          SUM(total_pedido_clp) AS ventas_totales_clp,
-          AVG(total_pedido_clp) AS ticket_promedio_clp,
-          MIN(fecha_pedido) AS fecha_primera_compra,
-          MAX(fecha_pedido) AS fecha_ultima_compra
-        FROM `{project_id}.{ai_dataset}.geo_pedidos_base`
-        WHERE comuna_canonica IS NOT NULL
-        GROUP BY
-          comuna_canonica,
-          provincia_canonica,
-          region_canonica;
-        """
-        _run_query(bq, sql_resumen_geografia, "resumen_geografia")
-
-        print(f"✅ geografía simplificada procesada correctamente para {brand_id}")
-
-    except Exception as e:
-        print("❌ ERROR EN procesar_geografia")
-        print(str(e))
-        print(traceback.format_exc())
-        raise
 
