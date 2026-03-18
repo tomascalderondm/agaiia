@@ -1,6 +1,6 @@
 AGENTES GOOGLE CLOUD RUN
 
-(procesar-finanzas)
+(procesar-productos)
 
 requirements.txt:
 
@@ -18,161 +18,120 @@ from google.cloud import bigquery
 BQ_LOCATION = "US"
 
 @functions_framework.cloud_event
-def procesar_finanzas(cloud_event):
+def procesar_productos(cloud_event):
     brand_id = base64.b64decode(cloud_event.data["message"]["data"]).decode("utf-8")
     bq = bigquery.Client()
 
-    sql_ventas_periodo = f"""
-    CREATE OR REPLACE TABLE `{bq.project}.{brand_id}_ai.resumen_ventas_periodo` AS
-    WITH monthly_orders AS (
+    sql = f"""
+    CREATE OR REPLACE TABLE `{bq.project}.{brand_id}_ai.resumen_productos_retencion` AS
+    WITH product_events AS (
       SELECT
-        EXTRACT(YEAR FROM fecha_pedido) AS anio,
-        EXTRACT(MONTH FROM fecha_pedido) AS mes,
-        SUM(total_pedido_clp) AS ventas_totales_clp,
-        COUNT(DISTINCT order_id) AS pedidos_totales,
-        COUNT(DISTINCT cliente_id) AS clientes_unicos,
-        AVG(total_pedido_clp) AS ticket_promedio_clp
-      FROM `{bq.project}.{brand_id}_core.fact_pedidos`
-      WHERE fecha_pedido IS NOT NULL
-      GROUP BY anio, mes
-    ),
-    monthly_units AS (
-      SELECT
-        EXTRACT(YEAR FROM fecha_pedido) AS anio,
-        EXTRACT(MONTH FROM fecha_pedido) AS mes,
-        SUM(COALESCE(cantidad, 1)) AS unidades_totales
-      FROM `{bq.project}.{brand_id}_core.fact_pedido_productos`
-      WHERE fecha_pedido IS NOT NULL
-      GROUP BY anio, mes
-    ),
-    monthly_base AS (
-      SELECT
-        o.anio,
-        o.mes,
-        o.ventas_totales_clp,
-        o.pedidos_totales,
-        o.clientes_unicos,
-        o.ticket_promedio_clp,
-        COALESCE(u.unidades_totales, 0) AS unidades_totales
-      FROM monthly_orders o
-      LEFT JOIN monthly_units u
-        ON o.anio = u.anio AND o.mes = u.mes
-    ),
-    monthly AS (
-      SELECT
-        'MES' AS granularidad,
-        anio,
-        mes,
-        FORMAT('%04d-%02d', anio, mes) AS periodo_label,
-        ventas_totales_clp,
-        pedidos_totales,
-        clientes_unicos,
-        ticket_promedio_clp,
-        unidades_totales,
-        SAFE_DIVIDE(
-          ventas_totales_clp - LAG(ventas_totales_clp) OVER (ORDER BY anio, mes),
-          NULLIF(LAG(ventas_totales_clp) OVER (ORDER BY anio, mes), 0)
-        ) AS variacion_pct_vs_mes_anterior,
-        SAFE_DIVIDE(
-          ventas_totales_clp - LAG(ventas_totales_clp, 12) OVER (ORDER BY anio, mes),
-          NULLIF(LAG(ventas_totales_clp, 12) OVER (ORDER BY anio, mes), 0)
-        ) AS variacion_pct_vs_anio_anterior
-      FROM monthly_base
-    ),
-    yearly_orders AS (
-      SELECT
-        EXTRACT(YEAR FROM fecha_pedido) AS anio,
-        SUM(total_pedido_clp) AS ventas_totales_clp,
-        COUNT(DISTINCT order_id) AS pedidos_totales,
-        COUNT(DISTINCT cliente_id) AS clientes_unicos,
-        AVG(total_pedido_clp) AS ticket_promedio_clp
-      FROM `{bq.project}.{brand_id}_core.fact_pedidos`
-      WHERE fecha_pedido IS NOT NULL
-      GROUP BY anio
-    ),
-    yearly_units AS (
-      SELECT
-        EXTRACT(YEAR FROM fecha_pedido) AS anio,
-        SUM(COALESCE(cantidad, 1)) AS unidades_totales
-      FROM `{bq.project}.{brand_id}_core.fact_pedido_productos`
-      WHERE fecha_pedido IS NOT NULL
-      GROUP BY anio
-    ),
-    yearly_base AS (
-      SELECT
-        o.anio,
-        o.ventas_totales_clp,
-        o.pedidos_totales,
-        o.clientes_unicos,
-        o.ticket_promedio_clp,
-        COALESCE(u.unidades_totales, 0) AS unidades_totales
-      FROM yearly_orders o
-      LEFT JOIN yearly_units u
-        ON o.anio = u.anio
-    ),
-    yearly AS (
-      SELECT
-        'ANIO' AS granularidad,
-        anio,
-        NULL AS mes,
-        CAST(anio AS STRING) AS periodo_label,
-        ventas_totales_clp,
-        pedidos_totales,
-        clientes_unicos,
-        ticket_promedio_clp,
-        unidades_totales,
-        NULL AS variacion_pct_vs_mes_anterior,
-        SAFE_DIVIDE(
-          ventas_totales_clp - LAG(ventas_totales_clp) OVER (ORDER BY anio),
-          NULLIF(LAG(ventas_totales_clp) OVER (ORDER BY anio), 0)
-        ) AS variacion_pct_vs_anio_anterior
-      FROM yearly_base
-    )
-    SELECT * FROM monthly
-    UNION ALL
-    SELECT * FROM yearly
-    """
-
-    sql_productos_ventas = f"""
-    CREATE OR REPLACE TABLE `{bq.project}.{brand_id}_ai.resumen_productos_ventas` AS
-    WITH base AS (
-      SELECT
-        EXTRACT(YEAR FROM fecha_pedido) AS anio,
-        EXTRACT(MONTH FROM fecha_pedido) AS mes,
+        cliente_id,
         product_name,
-        SUM(COALESCE(precio_linea_clp, 0)) AS ventas_producto_clp,
-        SUM(COALESCE(cantidad, 1)) AS unidades_vendidas,
-        COUNT(DISTINCT order_id) AS pedidos_con_producto,
-        COUNT(DISTINCT cliente_id) AS clientes_unicos_producto,
-        AVG(precio_linea_clp) AS ticket_promedio_producto_clp
+        order_id,
+        fecha_pedido,
+        precio_linea_clp
       FROM `{bq.project}.{brand_id}_core.fact_pedido_productos`
-      WHERE fecha_pedido IS NOT NULL
+      WHERE cliente_id IS NOT NULL
         AND product_name IS NOT NULL AND product_name != ''
-      GROUP BY anio, mes, product_name
     ),
-    total_mes AS (
+    product_customer AS (
       SELECT
-        anio,
-        mes,
-        SUM(ventas_producto_clp) AS total_mes_clp
-      FROM base
-      GROUP BY anio, mes
+        product_name,
+        cliente_id,
+        COUNT(DISTINCT order_id) AS compras_producto,
+        MIN(fecha_pedido) AS primera_compra_producto,
+        MAX(fecha_pedido) AS ultima_compra_producto
+      FROM product_events
+      GROUP BY product_name, cliente_id
+    ),
+    any_next_order AS (
+      SELECT
+        pc.product_name,
+        pc.cliente_id,
+        pc.compras_producto,
+        EXISTS (
+          SELECT 1
+          FROM `{bq.project}.{brand_id}_core.fact_pedidos` fp
+          WHERE fp.cliente_id = pc.cliente_id
+            AND fp.fecha_pedido > pc.primera_compra_producto
+        ) AS recompra_cualquier_cosa
+      FROM product_customer pc
+    ),
+    ordered_repeats AS (
+      SELECT
+        product_name,
+        cliente_id,
+        fecha_pedido,
+        LEAD(fecha_pedido) OVER (
+          PARTITION BY product_name, cliente_id
+          ORDER BY fecha_pedido
+        ) AS next_fecha
+      FROM product_events
+    ),
+    recompra_days AS (
+      SELECT
+        product_name,
+        cliente_id,
+        AVG(TIMESTAMP_DIFF(next_fecha, fecha_pedido, DAY)) AS dias_hasta_recompra
+      FROM ordered_repeats
+      WHERE next_fecha IS NOT NULL
+      GROUP BY product_name, cliente_id
+    ),
+    sales AS (
+      SELECT
+        product_name,
+        COUNT(DISTINCT cliente_id) AS clientes_unicos,
+        AVG(precio_linea_clp) AS ticket_promedio_producto
+      FROM product_events
+      GROUP BY product_name
     )
     SELECT
-      b.anio,
-      b.mes,
-      b.product_name,
-      b.ventas_producto_clp,
-      b.unidades_vendidas,
-      b.pedidos_con_producto,
-      b.clientes_unicos_producto,
-      b.ticket_promedio_producto_clp,
-      SAFE_DIVIDE(b.ventas_producto_clp, NULLIF(t.total_mes_clp, 0)) AS aporte_pct_ventas_periodo
-    FROM base b
-    LEFT JOIN total_mes t
-      ON b.anio = t.anio AND b.mes = t.mes
+      p.product_name,
+      s.clientes_unicos,
+      COUNT(DISTINCT CASE WHEN p.compras_producto >= 2 THEN p.cliente_id END) AS clientes_que_recompran_producto,
+      SAFE_DIVIDE(
+        COUNT(DISTINCT CASE WHEN p.compras_producto >= 2 THEN p.cliente_id END),
+        NULLIF(COUNT(DISTINCT p.cliente_id), 0)
+      ) AS repeat_rate_producto,
+      COUNT(DISTINCT CASE WHEN p.recompra_cualquier_cosa THEN p.cliente_id END) AS clientes_que_vuelven_a_comprar_cualquier_cosa,
+      SAFE_DIVIDE(
+        COUNT(DISTINCT CASE WHEN p.recompra_cualquier_cosa THEN p.cliente_id END),
+        NULLIF(COUNT(DISTINCT p.cliente_id), 0)
+      ) AS retention_rate_post_producto,
+      s.ticket_promedio_producto,
+      AVG(r.dias_hasta_recompra) AS dias_promedio_recompra_producto,
+      CASE
+        WHEN SAFE_DIVIDE(
+          COUNT(DISTINCT CASE WHEN p.recompra_cualquier_cosa THEN p.cliente_id END),
+          NULLIF(COUNT(DISTINCT p.cliente_id), 0)
+        ) >= 0.40 THEN 'ALTA_RETENCION'
+        WHEN SAFE_DIVIDE(
+          COUNT(DISTINCT CASE WHEN p.compras_producto >= 2 THEN p.cliente_id END),
+          NULLIF(COUNT(DISTINCT p.cliente_id), 0)
+        ) >= 0.30 THEN 'ALTA_RECOMPRA'
+        WHEN s.ticket_promedio_producto >= (
+          SELECT AVG(precio_linea_clp)
+          FROM `{bq.project}.{brand_id}_core.fact_pedido_productos`
+          WHERE precio_linea_clp IS NOT NULL
+        )
+        AND SAFE_DIVIDE(
+          COUNT(DISTINCT CASE WHEN p.recompra_cualquier_cosa THEN p.cliente_id END),
+          NULLIF(COUNT(DISTINCT p.cliente_id), 0)
+        ) < 0.15 THEN 'ALTO_TICKET_BAJA_RETENCION'
+        WHEN SAFE_DIVIDE(
+          COUNT(DISTINCT CASE WHEN p.recompra_cualquier_cosa THEN p.cliente_id END),
+          NULLIF(COUNT(DISTINCT p.cliente_id), 0)
+        ) >= 0.25 THEN 'PRODUCTO_GANCHO'
+        ELSE 'PRODUCTO_DE_UNA_SOLA_VEZ'
+      END AS clasificacion_retencion
+    FROM any_next_order p
+    LEFT JOIN recompra_days r
+      ON p.product_name = r.product_name
+     AND p.cliente_id = r.cliente_id
+    LEFT JOIN sales s
+      ON p.product_name = s.product_name
+    GROUP BY p.product_name, s.clientes_unicos, s.ticket_promedio_producto
     """
-
-    bq.query(sql_ventas_periodo, location=BQ_LOCATION).result()
-    bq.query(sql_productos_ventas, location=BQ_LOCATION).result()
-    print(f"✅ resúmenes financieros actualizados para {brand_id}")
+    bq.query(sql, location=BQ_LOCATION).result()
+    print(f"✅ resumen de productos actualizado para {brand_id}")
