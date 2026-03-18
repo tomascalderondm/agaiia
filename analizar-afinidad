@@ -1,0 +1,72 @@
+AGENTES GOOGLE CLOUD RUN
+
+(analizar-afinidad)
+
+requirements.txt:
+
+functions-framework==3.*
+google-cloud-bigquery==3.*
+
+
+
+MAIN.PY:
+
+import base64
+import functions_framework
+from google.cloud import bigquery
+
+BQ_LOCATION = "US"
+
+@functions_framework.cloud_event
+def analizar_afinidad(cloud_event):
+    brand_id = base64.b64decode(cloud_event.data["message"]["data"]).decode("utf-8")
+    bq = bigquery.Client()
+
+    sql = f"""
+    CREATE OR REPLACE TABLE `{bq.project}.{brand_id}_ai.afinidad_productos` AS
+    WITH pares AS (
+      SELECT
+        a.product_name AS producto_a,
+        b.product_name AS producto_b,
+        COUNT(DISTINCT a.order_id) AS pedidos_juntos
+      FROM `{bq.project}.{brand_id}_core.fact_pedido_productos` a
+      JOIN `{bq.project}.{brand_id}_core.fact_pedido_productos` b
+        ON a.order_id = b.order_id
+       AND a.product_name < b.product_name
+      WHERE a.product_name IS NOT NULL AND a.product_name != ''
+        AND b.product_name IS NOT NULL AND b.product_name != ''
+      GROUP BY 1, 2
+    ),
+    ventas_a AS (
+      SELECT
+        product_name,
+        COUNT(DISTINCT order_id) AS pedidos_producto
+      FROM `{bq.project}.{brand_id}_core.fact_pedido_productos`
+      WHERE product_name IS NOT NULL AND product_name != ''
+      GROUP BY 1
+    ),
+    ventas_b AS (
+      SELECT
+        product_name,
+        COUNT(DISTINCT order_id) AS pedidos_producto
+      FROM `{bq.project}.{brand_id}_core.fact_pedido_productos`
+      WHERE product_name IS NOT NULL AND product_name != ''
+      GROUP BY 1
+    )
+    SELECT
+      p.producto_a,
+      p.producto_b,
+      p.pedidos_juntos,
+      va.pedidos_producto AS pedidos_producto_a,
+      vb.pedidos_producto AS pedidos_producto_b,
+      SAFE_DIVIDE(p.pedidos_juntos, NULLIF(va.pedidos_producto, 0)) AS lift_desde_a,
+      SAFE_DIVIDE(p.pedidos_juntos, NULLIF(vb.pedidos_producto, 0)) AS lift_desde_b
+    FROM pares p
+    LEFT JOIN ventas_a va
+      ON p.producto_a = va.product_name
+    LEFT JOIN ventas_b vb
+      ON p.producto_b = vb.product_name
+    ORDER BY pedidos_juntos DESC
+    """
+    bq.query(sql, location=BQ_LOCATION).result()
+    print(f"✅ afinidad de productos actualizada para {brand_id}")
