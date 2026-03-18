@@ -1,0 +1,81 @@
+AGENTES GOOGLE CLOUD RUN
+
+(action-center)
+
+requirements.txt:
+
+functions-framework==3.*
+google-cloud-bigquery==3.*
+google-genai==0.*
+
+
+
+MAIN.PY:
+
+import base64
+import functions_framework
+from google.cloud import bigquery
+
+BQ_LOCATION = "US"
+
+@functions_framework.cloud_event
+def action_center(cloud_event):
+    brand_id = base64.b64decode(cloud_event.data["message"]["data"]).decode("utf-8")
+    bq = bigquery.Client()
+
+    sql = f"""
+    CREATE OR REPLACE TABLE `{bq.project}.{brand_id}_ai.action_center` AS
+    WITH clientes_riesgo AS (
+      SELECT
+        'CLIENTE' AS tipo_entidad,
+        CAST(cliente_id AS STRING) AS entidad_id,
+        nombre_canonico AS entidad_nombre,
+        'WINBACK_CLIENTE_RIESGO' AS accion,
+        CONCAT('Cliente con ', CAST(dias_inactividad AS STRING), ' días de inactividad y LTV ', CAST(ltv_historico AS STRING)) AS detalle,
+        90 AS prioridad
+      FROM `{bq.project}.{brand_id}_ai.resumen_clientes`
+      WHERE segmento_valor = 'CLIENTE EN RIESGO'
+    ),
+    clientes_campeon AS (
+      SELECT
+        'CLIENTE' AS tipo_entidad,
+        CAST(cliente_id AS STRING) AS entidad_id,
+        nombre_canonico AS entidad_nombre,
+        'FIDELIZAR_CLIENTE_CAMPEON' AS accion,
+        CONCAT('Cliente campeón con ', CAST(total_compras AS STRING), ' compras') AS detalle,
+        80 AS prioridad
+      FROM `{bq.project}.{brand_id}_ai.resumen_clientes`
+      WHERE segmento_valor = 'CLIENTE CAMPEON'
+    ),
+    productos_gancho AS (
+      SELECT
+        'PRODUCTO' AS tipo_entidad,
+        product_name AS entidad_id,
+        product_name AS entidad_nombre,
+        'ESCALAR_PRODUCTO_GANCHO' AS accion,
+        CONCAT('Producto con retención post compra de ', CAST(retention_rate_post_producto AS STRING)) AS detalle,
+        85 AS prioridad
+      FROM `{bq.project}.{brand_id}_ai.resumen_productos_retencion`
+      WHERE clasificacion_retencion IN ('ALTA_RETENCION', 'PRODUCTO_GANCHO')
+    ),
+    productos_baja_retencion AS (
+      SELECT
+        'PRODUCTO' AS tipo_entidad,
+        product_name AS entidad_id,
+        product_name AS entidad_nombre,
+        'REVISAR_PRODUCTO_BAJA_RETENCION' AS accion,
+        CONCAT('Producto con clasificación ', clasificacion_retencion) AS detalle,
+        70 AS prioridad
+      FROM `{bq.project}.{brand_id}_ai.resumen_productos_retencion`
+      WHERE clasificacion_retencion IN ('ALTO_TICKET_BAJA_RETENCION', 'PRODUCTO_DE_UNA_SOLA_VEZ')
+    )
+    SELECT * FROM clientes_riesgo
+    UNION ALL
+    SELECT * FROM clientes_campeon
+    UNION ALL
+    SELECT * FROM productos_gancho
+    UNION ALL
+    SELECT * FROM productos_baja_retencion
+    """
+    bq.query(sql, location=BQ_LOCATION).result()
+    print(f"✅ action center actualizado para {brand_id}")
